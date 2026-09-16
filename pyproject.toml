@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mubu-mcp"
-version = "1.0.0"
+version = "1.1.0"
 description = "Mubu (幕布) MCP Server — manage Mubu outlines via Model Context Protocol with pluggable caching"
 readme = "README.md"
 license = "MIT"

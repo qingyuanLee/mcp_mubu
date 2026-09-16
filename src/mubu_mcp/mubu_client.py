@@ -30,6 +30,8 @@ from mubu_mcp.mubu_config import (
 )
 from mubu_mcp.mubu_convert import (
     export_markdown,
+    gen_member_id,
+    gen_node_id,
     normalize_node,
     safe_filename,
 )
@@ -64,9 +66,11 @@ class MubuClient:
         # Restore cached token
         self._load_token()
 
-        # member_id priority: env > cache > constructor arg
-        if not self.member_id:
-            self.member_id = member_id or os.getenv("MUBU_MEMBER_ID")
+        # member_id: env/arg wins; otherwise generate a fresh random one
+        # (the web client issues a random 16-digit member id per editing
+        # session; the plain user id is NOT a valid member id and its use
+        # makes the server accept saves without persisting content).
+        self.member_id = member_id or os.getenv("MUBU_MEMBER_ID") or gen_member_id()
 
     # ------------------------------------------------------------------
     # Env file loading
@@ -74,20 +78,26 @@ class MubuClient:
 
     @staticmethod
     def _load_env_file() -> None:
-        env_path = os.path.expanduser("~/.workbuddy/.env.mubu")
-        if not os.path.isfile(env_path):
-            return
-        try:
-            for line in open(env_path, encoding="utf-8").read().splitlines():
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, value = line.partition("=")
-                key, value = key.strip(), value.strip().strip("\"'")
-                if key in ("MUBU_PHONE", "MUBU_PASSWORD", "MUBU_MEMBER_ID") and not os.getenv(key):
-                    os.environ[key] = value
-        except Exception:
-            pass
+        # 候选路径：项目级 .env 优先，再兼容 ~/.workbuddy/.env.mubu
+        project_env = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+            ".env",
+        )
+        env_paths = [project_env, os.path.expanduser("~/.workbuddy/.env.mubu")]
+        for env_path in env_paths:
+            if not os.path.isfile(env_path):
+                continue
+            try:
+                for line in open(env_path, encoding="utf-8").read().splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, _, value = line.partition("=")
+                    key, value = key.strip(), value.strip().strip("\"'")
+                    if key in ("MUBU_PHONE", "MUBU_PASSWORD", "MUBU_MEMBER_ID") and not os.getenv(key):
+                        os.environ[key] = value
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # Token persistence (via cache or file fallback)
@@ -260,8 +270,10 @@ class MubuClient:
         self.token = data["token"]
         self.user_id = data["id"]
         self.username = data["name"]
+        # memberId is not exposed by the login API; keep whatever session
+        # member id was already generated (or generate one).
         if not self.member_id:
-            self.member_id = data.get("memberId") or data.get("member_id")
+            self.member_id = gen_member_id()
         self._save_token()
         return {"token": self.token, "user_id": self.user_id, "username": self.username}
 
@@ -282,7 +294,7 @@ class MubuClient:
 
     def create_doc(self, name: str, folder_id: str = "0", content: str = "") -> str:
         data = self._request(*ENDPOINTS["create_doc"], json={"folderId": folder_id, "name": name, "content": content})
-        doc_id = data.get("doc", {}).get("id", "")
+        doc_id = data.get("id", "") or (data.get("doc", {}) or {}).get("id", "")
         if self._cache and doc_id:
             self._cache.invalidate_doc(doc_id)
         return doc_id
@@ -311,7 +323,77 @@ class MubuClient:
 
         return result
 
+    def get_doc_meta(self, doc_id: str) -> Dict:
+        """Fetch document metadata (parent folder, name, base version) without
+        node caching. Used by save flows that may need to recreate a doc."""
+        self.ensure_login()
+        data = self._request(*ENDPOINTS["get_doc"], json={
+            "docId": doc_id, "password": "", "isFromDocDir": True,
+        })
+        directory = data.get("directory") or []
+        folder_id = "0"
+        if directory:
+            folder_id = directory[-1].get("id") or "0"
+        return {
+            "folder_id": folder_id,
+            "name": data.get("name") or "",
+            "base_version": data.get("baseVersion") or 0,
+            "definition": data.get("definition") or "{}",
+        }
+
+    # ------------------------------------------------------------------
+    # Changeset event builders (real Mubu colla/events schema)
+    # ------------------------------------------------------------------
+
+    def build_create_root_event(self, root_node: Dict) -> Dict:
+        """Event that creates the root node of an empty document, carrying a
+        full subtree. Verified against the live server."""
+        return {
+            "name": "create",
+            "created": [{"index": 0, "parentId": None, "node": root_node, "path": ["nodes", 0]}],
+        }
+
+    def build_create_children_events(self, parent_id: str, children: List[Dict], start_index: int = 0) -> List[Dict]:
+        """Events that append child nodes under ``parent_id`` (index/path
+        aligned with the real web client)."""
+        events = []
+        for i, child in enumerate(children):
+            idx = start_index + i
+            events.append({
+                "name": "create",
+                "created": [{
+                    "index": idx,
+                    "parentId": parent_id,
+                    "node": child,
+                    "path": ["nodes", 0, "children", idx],
+                }],
+            })
+        return events
+
+    def build_update_root_event(self, old_root: Dict, new_text: str) -> Dict:
+        """Event that updates the root node's text (children are NOT changed
+        by an update event — verified against the live server)."""
+        return {
+            "name": "update",
+            "updated": [{
+                "updated": {
+                    "id": old_root.get("id", ""),
+                    "text": f"<span>{str(new_text or '').replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')}</span>",
+                    "modified": int(time.time() * 1000),
+                },
+                "original": {
+                    "id": old_root.get("id", ""),
+                    "text": old_root.get("text", ""),
+                    "modified": old_root.get("modified", 0),
+                },
+                "path": ["nodes", 0],
+            }],
+        }
+
     def build_update_event(self, doc_definition: Dict, doc_id: str) -> Dict:
+        """(Legacy) Build an update event for the whole document. The server
+        only applies the root text; use the explicit builders for real
+        structure changes."""
         nodes = doc_definition.get("nodes", []) if isinstance(doc_definition, dict) else []
         normalized_nodes = [normalize_node(n) for n in nodes]
         root = {"id": doc_id, "children": normalized_nodes, "modified": int(time.time() * 1000)}
@@ -327,10 +409,9 @@ class MubuClient:
                 events = [self.build_update_event(definition, doc_id)]
 
         if not self.member_id:
-            raise MubuError(
-                "Saving requires MUBU_MEMBER_ID. Set it as an env var "
-                "(find it in your browser's mubu.com network requests)."
-            )
+            # Random session member id (web client behaviour); the plain user
+            # id is not a valid member id.
+            self.member_id = gen_member_id()
 
         payload = {
             "memberId": self.member_id,
@@ -372,6 +453,57 @@ class MubuClient:
         self._request("POST", "/list/rename_folder", json={
             "id": folder_id, "name": new_name, "folderId": folder_id,
         })
+
+    # ------------------------------------------------------------------
+    # Folder path helpers (resolve / auto-create by slash-separated path)
+    # ------------------------------------------------------------------
+
+    def find_folder_by_path(self, path: str, root_folder_id: str = "0") -> Optional[str]:
+        """Resolve a slash-separated folder path to a folder ID.
+
+        Path is relative to ``root_folder_id`` (default "0" = root), e.g.
+        ``"工作/项目A/子目录"``. Returns the final folder ID, or ``None``
+        if any segment does not exist.
+        """
+        segments = [s for s in (path or "").strip().strip("/").split("/") if s]
+        current = root_folder_id
+        for seg in segments:
+            data = self.get_list(current)
+            folders = data.get("folders", []) or []
+            found = next((f.get("id") for f in folders if f.get("name") == seg), None)
+            if not found:
+                return None
+            current = found
+        return current
+
+    def ensure_folder_path(self, path: str, root_folder_id: str = "0") -> str:
+        """Ensure a slash-separated folder path exists, creating missing
+        folders level by level. Returns the final folder ID."""
+        segments = [s for s in (path or "").strip().strip("/").split("/") if s]
+        current = root_folder_id
+        for seg in segments:
+            data = self.get_list(current)
+            folders = data.get("folders", []) or []
+            found = next((f.get("id") for f in folders if f.get("name") == seg), None)
+            if not found:
+                found = self.create_folder(seg, current)
+            current = found
+        return current
+
+    def doc_exists_in_folder(self, folder_id: str, doc_id: str) -> bool:
+        """Check whether a document already lives in the given folder."""
+        data = self.get_list(folder_id)
+        docs = data.get("documents") or data.get("docs") or []
+        return any(d.get("id") == doc_id for d in docs)
+
+    def find_doc_in_folder(self, folder_id: str, name: str) -> Optional[str]:
+        """Find a document by exact name inside a folder. Returns its ID or None."""
+        data = self.get_list(folder_id)
+        docs = data.get("documents") or data.get("docs") or []
+        for d in docs:
+            if d.get("name") == name:
+                return d.get("id")
+        return None
 
     # ------------------------------------------------------------------
     # Search

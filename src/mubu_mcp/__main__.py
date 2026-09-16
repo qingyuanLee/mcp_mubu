@@ -20,9 +20,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--transport",
-        choices=["stdio", "http", "sse"],
+        choices=["stdio", "http", "sse", "streamable-http"],
         default="stdio",
-        help="Transport to use (default: stdio).",
+        help="Transport to use (default: stdio). 'http' is an alias for 'streamable-http'.",
     )
     parser.add_argument(
         "--host",
@@ -64,9 +64,11 @@ def main() -> None:
     # Import server (triggers tool/resource registration)
     from mubu_mcp.server import mcp  # noqa: E402
 
-    if args.transport == "http":
-        mcp.run(transport="http", host=args.host, port=args.port)
-    elif args.transport == "sse":
+    # mcp 2.x 的 transport 名称为 "streamable-http"（旧文档中的 "http" 作为别名映射）
+    transport = "streamable-http" if args.transport == "http" else args.transport
+    if transport == "streamable-http":
+        mcp.run(transport="streamable-http", host=args.host, port=args.port)
+    elif transport == "sse":
         mcp.run(transport="sse", host=args.host, port=args.port)
     else:
         mcp.run(transport="stdio")

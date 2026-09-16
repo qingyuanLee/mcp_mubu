@@ -6,10 +6,76 @@ for the MCP server context.
 
 from __future__ import annotations
 
+import random
 import re
 import time
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, List
+
+
+# ---------------------------------------------------------------------------
+# Mubu node helpers (real server schema)
+# ---------------------------------------------------------------------------
+
+_NODE_ID_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+_NODE_ID_LETTERS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+def gen_node_id() -> str:
+    """Generate a short random node id (10 chars, first char a letter),
+    matching the ids observed in real Mubu documents (e.g. VPI4liKaE5)."""
+    return random.choice(_NODE_ID_LETTERS) + "".join(
+        random.choice(_NODE_ID_CHARS) for _ in range(9)
+    )
+
+
+def gen_member_id() -> str:
+    """Generate a random 16-digit member id, like the web client does per
+    editing session (server records it in colla/members_v2)."""
+    return str(random.randint(10**15, 10**16 - 1))
+
+
+def _esc_html(s: Any) -> str:
+    return str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _mubu_node(text: Any, children: List[Dict], checked: bool = False) -> Dict[str, Any]:
+    """Build a node in the real Mubu definition schema."""
+    return {
+        "id": gen_node_id(),
+        "text": f"<span>{_esc_html(text)}</span>",
+        "modified": int(time.time() * 1000),
+        "children": children,
+        "collapsed": False,
+        "finish": bool(checked),
+        "color": "",
+        "heading": 0,
+        "taskStatus": 0,
+    }
+
+
+def markdown_to_mubu_tree(md: str) -> Dict[str, Any]:
+    """Parse Markdown into a single root node in the real Mubu node schema.
+
+    Returns the root node dict (with nested ``children``), ready to be sent
+    inside a ``create`` changeset event. Heading / list / checkbox / note
+    structure comes from :func:`markdown_to_doc`.
+    """
+    parsed = markdown_to_doc(md)
+    root_in = parsed.get("node") or {}
+    text = root_in.get("text") or ""
+
+    def conv(node: Dict[str, Any]) -> Dict[str, Any]:
+        return _mubu_node(
+            node.get("text") or "",
+            [conv(c) for c in node.get("children") or []],
+            checked=bool(node.get("checked") or node.get("finish")),
+        )
+
+    root = conv(root_in)
+    if not text and not root["children"]:
+        root["text"] = "<span>未命名文档</span>"
+    return root
 
 
 # ---------------------------------------------------------------------------
